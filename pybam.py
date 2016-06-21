@@ -3,7 +3,7 @@ import sys
 import zlib
 import struct
 import itertools
-import subprocess
+import gzip
 
 ##########################################
 ## Documentation ? What documentation.. ##
@@ -122,96 +122,80 @@ class bgunzip:
     def next(self): return next(self._iterator)
 
     def _generator(self):
-        try:
-            if type(self.file_handle) == str: p = subprocess.Popen(['pigz','-dc',self.file_handle], stdout=subprocess.PIPE)
-            elif type(self.file_handle) == file: p = subprocess.Popen(['pigz','-dc'],stdin=self.file_handle, stdout=subprocess.PIPE)
-            else: print 'ERROR: I do not know how to open and read from "' + str(self.file_handle) + '"'; exit()
-            self.file_handle = p.stdout
-            sys.stderr.write('Using pigz!\n')
-        except OSError:
-            try:
-                if type(self.file_handle) == str:    p = subprocess.Popen(['gzip','--stdout','--decompress','--force',self.file_handle]       , stdout=subprocess.PIPE)
-                elif type(self.file_handle) == file: p = subprocess.Popen(['gzip','--stdout','--decompress','--force'], stdin=self.file_handle, stdout=subprocess.PIPE)
-                else: print 'ERROR: I do not know how to open and read from "' + str(self.file_handle) + '"'; exit()
-                self.file_handle = p.stdout
-                sys.stderr.write('Using gzip!\n')
-            except OSError:
-                sys.stderr.write('Using internal Python...\n') # We will end up using the python code below. It is faster than the gzip module, but
-                                                               # due to how slow Python's zlib module is, it will end up being about 2x slower than pysam.
-        data = self.file_handle.read(655360)
-        self.bytes_read += 655360
-        cache = []
-        blocks_left_to_grab = self.blocks_at_a_time
-        bs = 0
-        checkpoint = 0
-        #pool = Pool(processes=3) 
-        #def decompress(data): return zlib.decompress(data, 47) # 47 == zlib.MAX_WBITS|32
-        decompress = zlib.decompress
-        while data:
-            if len(data) - bs < 65536:
-                data = data[bs:] + self.file_handle.read(35536)
-                self.bytes_read += len(data) - bs
-                bs = 0
+        with gzip.open(self.file_handle, 'rb') as f:
+           data = f.read(655360)
+           self.bytes_read += 655360
+           cache = []
+           blocks_left_to_grab = self.blocks_at_a_time
+           bs = 0
+           checkpoint = 0
+           #pool = Pool(processes=3) 
+           #def decompress(data): return zlib.decompress(data, 47) # 47 == zlib.MAX_WBITS|32
+           decompress = zlib.decompress
+           while data:
+               if len(data) - bs < 65536:
+                   data = data[bs:] + f.read(35536)
+                   self.bytes_read += len(data) - bs
+                   bs = 0
 
-            magic = data[bs:bs+4]
-            if not magic: break # a child's heart
-            if magic != "\x1f\x8b\x08\x04":
-                if magic == 'BAM\1':
-                    # The user has passed us already unzipped data, or we're reading from pigz/gzip :)
-                    while data:
-                        yield data
-                        data = self.file_handle.read(35536)
-                        self.bytes_read += len(data)
-                    raise StopIteration
-                elif magic == 'SQLi': print 'OOPS: You have used an SQLite database as your input BAM file!!'; exit()
-                else:                 print 'ERROR: The input file is not in a format I understand :('       ; exit()
+               magic = data[bs:bs+4]
+               if not magic: break # a child's heart
+               if magic != "\x1f\x8b\x08\x04":
+                   if magic == 'BAM\1':
+                       # The user has passed us already unzipped data, or we're reading from pigz/gzip :)
+                       while data:
+                           yield data
+                           data = f.read(35536)
+                           self.bytes_read += len(data)
+                       raise StopIteration
+                   elif magic == 'SQLi': print 'OOPS: You have used an SQLite database as your input BAM file!!'; exit()
+                   else:                 print 'ERROR: The input file is not in a format I understand :('       ; exit()
 
-            try:
-                # The gzip format allows compression containers to store metadata about whats inside them. bgzip uses this
-                # to encode the virtual file pointers, final decompressed block size, crc checks etc - however we really dont
-                # care -- we just want to unzip everything as quickly as possible. So instead of 'following the rules', and parsing this metadata safely,
-                # we try to take a short-cut and jump right to the good stuff, and only if that fails we go the long-way-around and parse every bit of metadata properly:
+               try:
+                   # The gzip format allows compression containers to store metadata about whats inside them. bgzip uses this
+                   # to encode the virtual file pointers, final decompressed block size, crc checks etc - however we really dont
+                   # care -- we just want to unzip everything as quickly as possible. So instead of 'following the rules', and parsing this metadata safely,
+                   # we try to take a short-cut and jump right to the good stuff, and only if that fails we go the long-way-around and parse every bit of metadata properly:
 
-                #cache.append(decompress(data[bs+18:more_bs-8])) ## originally i stored uncompressed data in a list and used map() to decompress in multiple threads. Was not faster.
-                #new_zipped_data = data[bs:more_bs]              ## originally i decompressed the data with a standard zlib.decompress(data,47), headers and all. Was slower.
-                more_bs = bs + struct.unpack("<H", data[bs+16:bs+18])[0] +1
-                cache.append(decompress(data[bs+18:more_bs-8],-15))
-                bs = more_bs
-            except: ## zlib doesnt have a nice exception for when things go wrong. just "error"
-                sys.stderr.write('INFO: Odd bzgip block detected! The author of pybam didnt think this would ever happen... please could you let me know?')
-                header_data = magic + data[bs+4:bs+12]
-                header_size = 12
-                extra_len = struct.unpack("<H", header_data[-2:])[0]
-                while header_size-12 < extra_len:
-                    header_data += data[bs+12:bs+16]
-                    subfield_id = header_data[-4:-2]
-                    subfield_len = struct.unpack("<H", header_data[-2:])[0]
-                    subfield_data = data[bs+16:bs+16+subfield_len]
-                    header_data += subfield_data
-                    header_size += subfield_len + 4
-                    if subfield_id == 'BC': block_size = struct.unpack("<H", subfield_data)[0]
-                raw_data = data[bs+16+subfield_len:bs+16+subfield_len+block_size-extra_len-19]
-                crc_data = data[bs+16+subfield_len+block_size-extra_len-19:bs+16+subfield_len+block_size-extra_len-19+8] # I have left the numbers in verbose, because the above try is the optimised code.
-                bs = bs+16+subfield_len+block_size-extra_len-19+8
-                zipped_data = header_data + raw_data + crc_data
-                cache.append(decompress(zipped_data,47)) # 31 works the same as 47.
-                # Although the following in the bgzip code from biopython, its not needed if you let zlib decompress the whole zipped_data, header and crc, because it checks anyway (in C land)
-                # I've left the manual crc checks in for documentation purposes:
-                expected_crc = crc_data[:4]
-                expected_size = struct.unpack("<I", crc_data[4:])[0]
-                if len(unzipped_data) != expected_size: print 'ERROR: Failed to unpack due to a Type 1 CRC error. Could the BAM be corrupted?'; exit()
-                crc = zlib.crc32(unzipped_data)
-                if crc < 0: crc = struct.pack("<i", crc)
-                else:       crc = struct.pack("<I", crc)
-                if expected_crc != crc: print 'ERROR: Failed to unpack due to a Type 2 CRC error. Could the BAM be corrupted?'; exit()
+                   #cache.append(decompress(data[bs+18:more_bs-8])) ## originally i stored uncompressed data in a list and used map() to decompress in multiple threads. Was not faster.
+                   #new_zipped_data = data[bs:more_bs]              ## originally i decompressed the data with a standard zlib.decompress(data,47), headers and all. Was slower.
+                   more_bs = bs + struct.unpack("<H", data[bs+16:bs+18])[0] +1
+                   cache.append(decompress(data[bs+18:more_bs-8],-15))
+                   bs = more_bs
+               except: ## zlib doesnt have a nice exception for when things go wrong. just "error"
+                   sys.stderr.write('INFO: Odd bzgip block detected! The author of pybam didnt think this would ever happen... please could you let me know?')
+                   header_data = magic + data[bs+4:bs+12]
+                   header_size = 12
+                   extra_len = struct.unpack("<H", header_data[-2:])[0]
+                   while header_size-12 < extra_len:
+                       header_data += data[bs+12:bs+16]
+                       subfield_id = header_data[-4:-2]
+                       subfield_len = struct.unpack("<H", header_data[-2:])[0]
+                       subfield_data = data[bs+16:bs+16+subfield_len]
+                       header_data += subfield_data
+                       header_size += subfield_len + 4
+                       if subfield_id == 'BC': block_size = struct.unpack("<H", subfield_data)[0]
+                   raw_data = data[bs+16+subfield_len:bs+16+subfield_len+block_size-extra_len-19]
+                   crc_data = data[bs+16+subfield_len+block_size-extra_len-19:bs+16+subfield_len+block_size-extra_len-19+8] # I have left the numbers in verbose, because the above try is the optimised code.
+                   bs = bs+16+subfield_len+block_size-extra_len-19+8
+                   zipped_data = header_data + raw_data + crc_data
+                   cache.append(decompress(zipped_data,47)) # 31 works the same as 47.
+                   # Although the following in the bgzip code from biopython, its not needed if you let zlib decompress the whole zipped_data, header and crc, because it checks anyway (in C land)
+                   # I've left the manual crc checks in for documentation purposes:
+                   expected_crc = crc_data[:4]
+                   expected_size = struct.unpack("<I", crc_data[4:])[0]
+                   if len(unzipped_data) != expected_size: print 'ERROR: Failed to unpack due to a Type 1 CRC error. Could the BAM be corrupted?'; exit()
+                   crc = zlib.crc32(unzipped_data)
+                   if crc < 0: crc = struct.pack("<i", crc)
+                   else:       crc = struct.pack("<I", crc)
+                   if expected_crc != crc: print 'ERROR: Failed to unpack due to a Type 2 CRC error. Could the BAM be corrupted?'; exit()
 
-            blocks_left_to_grab -= 1
-            if blocks_left_to_grab == 0:
-                yield ''.join(cache)
-                cache = []
-                blocks_left_to_grab = self.blocks_at_a_time
-        self.file_handle.close()
-        if cache != '': yield ''.join(cache)
+               blocks_left_to_grab -= 1
+               if blocks_left_to_grab == 0:
+                   yield ''.join(cache)
+                   cache = []
+                   blocks_left_to_grab = self.blocks_at_a_time
+           if cache != '': yield ''.join(cache)
 
 
 
